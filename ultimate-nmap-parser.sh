@@ -1,7 +1,7 @@
 #!/bin/bash
 fname="ultimate-nmap-parser.sh"
-version="0.8"
-modified="04/06/2025"
+version="0.9"
+modified="03/23/2026"
 
 : '
 TO DO:
@@ -116,6 +116,8 @@ men_closed="N"
 men_report1="N"
 men_htmlreport="N"
 men_summarylog="N"
+# recursive flag - opt-in only, not included in --all
+men_recursive="N"
 
 function header () {
 # header function  - used to print out the title of the script 
@@ -171,6 +173,7 @@ echo "	--ssl		Generate ssl/tls hosts list IP:PORT - $outputsslfile"
 echo "	--hostports	Generate hosts/hosts_<PORT>-<PROTOCOL>-<SERVICE>.txt files"
 #echo "	--html		Generates a .html report for each scan (uses xml file - will auto pickup from \$pwd)"
 echo "	--summarylog		Parses all local *.log file and creats ip:port/proto file - summary.log"
+echo "	--r, --recursive	Recursively find and parse .gnmap files from current directory"
 echo "  	--report1   	Report - IP[PORT1,PORT2,PORT3, ] - parsip.pl" 
 echo 
 echo -e "\e[39m[*] Example:"
@@ -178,6 +181,8 @@ echo
 echo "$fname *.gnmap --all"
 echo "$fname nmap_tcp_full.gnmp nmap_udp_def.gnmap --summary --unique"
 echo "$fname nmap_tcp_full.gnmp nmap_udp_def.gnmap --web"
+# recursive example - no filenames needed, finds .gnmap files automatically
+echo "$fname --all --recursive"
 echo
 echo "--------------------------------------------------------------------------------------"
 echo
@@ -207,30 +212,22 @@ rm "${outpath}tempinput" "${outpath}ipptemp" "${outpath}closedtemp" "${outpath}s
 function makecsv () {
 # this is the main function which processes the inputfile and creates a csv file 
 echo -e "\e[1m\e[93m[>]\e[0m Creating CSV File"
-while read line; do
-	checkport=$(echo $line | grep -e '/open/' -e '/closed')
-	if [ "$checkport" != "" ]; then
-		host=$(echo $line | awk '{print $2}')
-		lineports=$(echo $line | awk '{$1=$2=$3=$4=""; print $0}')
-		if [ -f "${outpath}"tempfile2"" ]; then rm "${outpath}"tempfile2""; fi
-		echo "$lineports" | tr "," "\n" | sed 's/^ *//g' >> "${outpath}"tempfile2""
-		# Read the per-host temp file to write each open port as a line to the CSV temp file
-		while read templine; do
-		# check for open port
-		checkport2=$(echo $templine | grep -e '/open/' -e '/closed')
-		if [ "$checkport2" != "" ]; then
-			port=$(echo $templine | awk -F '/' '{print $1}')
-			status=$(echo $templine | awk -F '/' '{print $2}')
-			protocol=$(echo $templine | awk -F '/' '{print $3}')
-			service=$(echo $templine | awk -F '/' '{print $5}')
-			version=$(echo $templine | awk -F '/' '{print $7}')
-			echo "$host,$port,$status,$protocol,$service,$version" >> "${outpath}$csvtemp"
-		fi
-		done < "${outpath}tempfile2"
-	fi
-done < "${outpath}$inputtemp" 
 
-
+# single-pass awk replaces the original per-line shell loop for speed
+# split on "/," which is the actual port entry terminator, preserving commas in version strings
+awk '/\/open\/|\/closed\//{
+    host=$2
+    match($0, /Ports:[^\t]*/)
+    ports=substr($0, RSTART+7, RLENGTH-7)
+    n=split(ports, entries, "/,")
+    for(i=1; i<=n; i++) {
+        gsub(/^ +/, "", entries[i])
+        m=split(entries[i], f, "/")
+        if(f[2]=="open" || f[2]=="closed") {
+            printf "%s,%s,%s,%s,%s,%s\n", host, f[1], f[2], f[3], f[5], f[7]
+        }
+    }
+}' "${outpath}$inputtemp" > "${outpath}$csvtemp"
 
 # finalise and move the file if temp.csv
 if [ -f "${outpath}$csvtemp" ]; then
@@ -278,25 +275,18 @@ checkcsv
 #clear any old file - fresh
 rm "${outpath}$outputsummaryfile" > /dev/null 2>&1
 
-echo "+=========================================================================================+" >> "${outpath}$outputsummaryfile"
-printf "%-18s %-16s %-52.52s %-2s \n" "| HOST " "| PORT / PROTOCOL" " | SERVICE" "|" >> "${outpath}$outputsummaryfile"
-lasthost=""
-while read line; do
-	host=$(echo $line | awk -F ',' '{print $1}')
-	port=$(echo $line | awk -F ',' '{print $2}')
-	protocol=$(echo $line | awk -F ',' '{print $4}')
-	service=$(echo $line | awk -F ',' '{print $5}')
-	version=$(echo $line | awk -F ',' '{print $6}')
-	if [ "$host" != "$lasthost" ]; then echo "+=========================================================================================+" >> "${outpath}$outputsummaryfile"; fi
-	if [ "$version" = "" ]; then
-		version=""
-	else
-		version="- $version"
-	fi
-	printf "%-18s %-16s %-52.52s %-2s \n" "| $host " "| $port / $protocol " "  | $service $version" " |" >> "${outpath}$outputsummaryfile"
-	lasthost="$host"
-done < "$tempfile"
-echo "+=========================================================================================+" >> "${outpath}$outputsummaryfile"
+# single-pass awk replaces per-line shell loop for speed
+{
+echo "+=========================================================================================+"
+printf "%-18s %-16s %-52.52s %-2s \n" "| HOST " "| PORT / PROTOCOL" " | SERVICE" "|"
+awk -F',' '{
+    if($1 != lasthost && NR>1) print "+=========================================================================================+"
+    ver = ($6 != "") ? "- " $6 : ""
+    printf "%-18s %-16s %-52.52s %-2s \n", "| " $1 " ", "| " $2 " / " $4 " ", "  | " $5 " " ver, " |"
+    lasthost=$1
+}' "$tempfile"
+echo "+=========================================================================================+"
+} > "${outpath}$outputsummaryfile"
 
 echo "	- $outputsummaryfile"
 echo
@@ -479,6 +469,9 @@ then
 	rm "${outpath}$outputsmbfile" > /dev/null 2>&1
 else
 	echo "	- $outputsmbfile"
+	# also create plain IP list for SMB hosts
+	cat "$inputfilepath" | grep '445/open/tcp/' | awk '{ print $2}' | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b" | sort -u -V > "${outpath}smb-ips.txt"
+	echo "	- smb-ips.txt"
 fi
 echo
 
@@ -495,24 +488,17 @@ rm "${outpath}$webfinalname" "${outpath}webtemp2"  > /dev/null 2>&1
 #check that the csv file has been created
 checkcsv
 
-# NEED To check that its not UDP 
-for line in $(cat "$tempfile"); do
-	host=$(echo $line | awk -F ',' '{print $1}')
-	port=$(echo $line | awk -F ',' '{print $2}')
-	service=$(echo $line | awk -F ',' '{print $5}')
-	version=$(echo $line | awk -F ',' '{print $6}')
-	
-	# a little overboard with the checks just to make sure all web ports are collected
-	if [ "$port" = "80" ]; then echo "http://${host}:$port/" >> "${outpath}webtemp2"; fi
-   	if [ "$port" = "443" ]; then echo "https://${host}:$port/" >> "${outpath}webtemp2"; fi
-    if [ "$port" = "8080" ]; then echo "http://${host}:$port/" >> "${outpath}webtemp2"; fi
-    if [ "$port" = "8443" ]; then echo "https://${host}:$port/" >> "${outpath}webtemp2"; fi
-	
-	if [ "$service" = "http" ]; then echo "http://${host}:$port/" >> "${outpath}webtemp2"; fi
-	if [[ "$service" == *"ssl"* ]]; then echo "https://${host}:$port/" >> "${outpath}webtemp2"; fi
-	if [[ "$version" == *"Web"* ]]; then echo "http://${host}:$port/" >> "${outpath}webtemp2"; fi
-	if [[ "$version" == *"web"* ]]; then echo "http://${host}:$port/" >> "${outpath}webtemp2"; fi
-done
+# single-pass awk replaces per-line shell loop for speed
+awk -F',' '{
+	host=$1; port=$2; service=$5; version=$6
+	if(port=="80")   print "http://" host ":" port "/"
+	if(port=="443")  print "https://" host ":" port "/"
+	if(port=="8080") print "http://" host ":" port "/"
+	if(port=="8443") print "https://" host ":" port "/"
+	if(service=="http") print "http://" host ":" port "/"
+	if(service ~ /ssl/) print "https://" host ":" port "/"
+	if(tolower(version) ~ /web/) print "http://" host ":" port "/"
+}' "$tempfile" > "${outpath}webtemp2"
 
 # if webtemp2 exists then sort it 
 if [ -f "${outpath}webtemp2" ]; then
@@ -542,129 +528,31 @@ checkcsv
 # start fresh
 rm "${outpath}$webfinalname" "${outpath}webtemp1"  "${outpath}webtemp2" "${outpath}webtemp3" "${outpath}outputwebfile2" /tmp/we*.txt  > /dev/null 2>&1
 
+# single-pass awk replaces per-line shell loop for speed
+# checks known web ports + service/version matching
+awk -F',' 'BEGIN {
+    # known web ports
+    split("80,443,8080,8443,8000,8888,8181,4443,8880,10443,5000,5001,9000,9443,7000,7001,7443,9090", wp, ",")
+    for(i in wp) webports[wp[i]]=1
+}
+{
+    host=$1; port=$2; service=$5; version=$6
 
-# NEED To check that its not UDP 
-for line in $(cat "$tempfile"); do
-	host=$(echo $line | awk -F ',' '{print $1}')
-	port=$(echo $line | awk -F ',' '{print $2}')
-	service=$(echo $line | awk -F ',' '{print $5}')
-	version=$(echo $line | awk -F ',' '{print $6}')
-	
-	## a little overboard with the checks just to make sure all web ports are collected
-	if [ "$port" = "80" ]; then echo "http://${host}:$port/" >> "${outpath}webtemp1"; fi
-   	if [ "$port" = "443" ]; then echo "https://${host}:$port/" >> "${outpath}webtemp1"; fi
-    if [ "$port" = "8080" ]; then echo "http://${host}:$port/" >> "${outpath}webtemp1"; fi
-    if [ "$port" = "8443" ]; then echo "https://${host}:$port/" >> "${outpath}webtemp1"; fi
-    if [ "$port" = "8000" ]; then echo "http://${host}:$port/" >> "${outpath}webtemp1"; fi
+    # service/version based detection
+    if(service=="http") print "http://" host ":" port "/"
+    if(service ~ /ssl/) print "https://" host ":" port "/"
+    if(tolower(version) ~ /web/) print "http://" host ":" port "/"
 
-
-	ports=(80 443 8080 8443 8000 8888 8181 4443 8880 10443 5000 5001 9000 9443 7000 7001 7443 9090)
-
-	for port2 in "${ports[@]}"; do 
-		if [ "$port2" = "$port" ]; then
-
-				case "$port" in
-			80)
-				echo "http://${host}:80/" >> "${outpath}webtemp2"
-				;;
-			443)
-				echo "https://${host}:443/" >> "${outpath}webtemp2"
-				;;
-			*)
-				echo "http://${host}:${port}/" >> "${outpath}webtemp2"
-				echo "https://${host}:${port}/" >> "${outpath}webtemp2"
-				;;
-			esac
-		
-		fi
-	done
-
-
-
-	if [ "$service" = "http" ]; then echo "http://${host}:$port/" >> "${outpath}webtemp1"; fi
-	if [[ "$service" == *"ssl"* ]]; then echo "https://${host}:$port/" >> "${outpath}webtemp1"; fi
-	if [[ "$version" == *"Web"* ]]; then echo "http://${host}:$port/" >> "${outpath}webtemp1"; fi
-	if [[ "$version" == *"web"* ]]; then echo "http://${host}:$port/" >> "${outpath}webtemp1"; fi
-	
-	
-	
-	
-done
-
-
-##cat "${outpath}webtemp1" 2>/dev/null | sort -u > /tmp/web1.txt
-#
-#ports=(80 443 8080 8443 8000 8888 8181 4443 8880 10443 5000 5001 9000 9443 7000 7001 7443 9090)
-#
-#for port2 in "${ports[@]}"; do 
-#	if [ "$port2" = "$port" ]; then
-#
-#			case "$port" in
-#        80)
-#            echo "http://${host}:80/" >> "${outpath}webtemp2"
-#            ;;
-#        443)
-#            echo "https://${host}:443/" >> "${outpath}webtemp2"
-#            ;;
-#        *)
-#            echo "http://${host}:${port}/" >> "${outpath}webtemp2"
-#            echo "https://${host}:${port}/" >> "${outpath}webtemp2"
-#            ;;
-#		esac
-#	
-#	fi
-#done
-
-
-#cat "${outpath}webtemp2" 2>/dev/null | sort -u > /tmp/web2.txt
-
-
-
-
-
-## Define your web interface ports
-#ports=(80 443 8080 8443 8000 8888 8181 4443 8880 10443 5000 5001 9000 9443 7000 7001 7443 9090)
-#
-## start fresh
-##rm "${outpath}$webfinalname" "${outpath}webtemp3"  > /dev/null 2>&1
-#
-## Grep through logs and extract IP and port
-#grep "Discovered open" nmap*.log 2>/dev/null | while read -r line; do
-#    # Example line: Discovered open port 8080/tcp on 10.0.0.11
-#    port=$(echo "$line" | awk '{print $4}' | cut -d/ -f1)
-#    ip=$(echo "$line" | awk '{print $6}')
-#
-#    # Validate
-#    [[ -z "$port" || -z "$ip" ]] && continue
-#
-#    # Check if port is in our web port list
-#    if [[ " ${ports[*]} " =~ " $port " ]]; then
-#        if [[ "$port" == "80" ]]; then
-#            echo "http://${ip}:80/" >> "${outpath}webtemp3"
-#        elif [[ "$port" == "443" ]]; then
-#            echo "https://${ip}:443/" >> "${outpath}webtemp3"
-#        else
-#            echo "http://${ip}:${port}/" >> "${outpath}webtemp3"
-#            echo "https://${ip}:${port}/" >> "${outpath}webtemp3"
-#        fi
-#    fi
-#done
-
-cat "${outpath}webtemp1" "${outpath}webtemp2" "${outpath}webtemp3" 2>/dev/null| sort -u > "${outpath}$outputwebfile2"
-#
-
-#rm "${outpath}$webfinalname" "${outpath}webtem* /tmp/we*.txt"  > /dev/null 2>&1
-
-# wanted to parse log but broke
-#if [ -f "${outpath}webtemp1" ] || [ -f "${outpath}webtemp3" ] || [ -f "${outpath}webtemp3" ]; then
-#	#sort -u "${outpath}webtemp2" | $sortip | sort -t'/' -k2 -V  > "${outpath}$outputwebfile2" 2>&1
-#	cat "${outpath}webtemp1" "${outpath}webtemp2" "${outpath}webtemp3" 2>/dev/null | sort -u | $sortip | sort -t'/' -k2 -V > "${outpath}$outputwebfile2" 2>&1
-#	echo "	- $outputwebfile2"
-#else
-#	echo -e "$RED	- no ports found $RESETCOL"
-#	rm "${outpath}$outputwebfile2" > /dev/null 2>&1
-#fi
-#
+    # known web port detection
+    if(port in webports) {
+        if(port=="80")       print "http://" host ":80/"
+        else if(port=="443") print "https://" host ":443/"
+        else {
+            print "http://" host ":" port "/"
+            print "https://" host ":" port "/"
+        }
+    }
+}' "$tempfile" | sort -u > "${outpath}$outputwebfile2"
 
 echo "	- $outputwebfile2"
 echo ""
@@ -682,20 +570,12 @@ rm "${outpath}$outputsslfile" "${outpath}ssltemp2" > /dev/null 2>&1
 #check that the csv file has been created
 checkcsv
 
-for line in $(cat "$tempfile"); do
-	host=$(echo $line | awk -F ',' '{print $1}')
-	port=$(echo $line | awk -F ',' '{print $2}')
-	service=$(echo $line | awk -F ',' '{print $5}')
-	version=$(echo $line | awk -F ',' '{print $6}')
-	
-	# a little overboard again - just to get anything with ssl or tls in 
-	if [[ "$port" -eq "443" ]]; then echo "${host}:$port" >> "${outpath}ssltemp2"; fi
-	if [[ "$service" == *"ssl"* ]]; then echo "${host}:$port" >> "${outpath}ssltemp2"; fi
-	if [[ "$version" == *"ssl"* ]]; then echo "${host}:$port" >> "${outpath}ssltemp2"; fi
-	if [[ "$service" == *"tls"* ]]; then echo "${host}:$port" >> "${outpath}ssltemp2"; fi
-	if [[ "$version" == *"tls"* ]]; then echo "${host}:$port" >> "${outpath}ssltemp2"; fi
-
-done
+# single-pass awk replaces per-line shell loop for speed
+awk -F',' '{
+	host=$1; port=$2; service=$5; version=$6
+	if(port=="443" || service ~ /ssl/ || version ~ /ssl/ || service ~ /tls/ || version ~ /tls/)
+		print host ":" port
+}' "$tempfile" > "${outpath}ssltemp2"
 
 
 # if webtemp2 exists then sort it 
@@ -731,76 +611,39 @@ hostportspath=$(realpath "$outpath$outhostsdir")
 #check that the csv file has been created
 checkcsv
 
-# loop through and Create split hosts files for each protocol
-for line in $(cat "$tempfile"); do
-	host=$(echo $line | awk -F ',' '{print $1}')
-	port=$(echo $line | awk -F ',' '{print $2}')
-	proto=$(echo $line | awk -F ',' '{print $4}')
-	service=$(echo $line | awk -F ',' '{print $5}' | tr -d '-' | tr -d '?' | tr -d '|' )
-	# need to add better service names
-	
-	# check and tidy up the names for consistancy and to stop spam duplicates
-	printout="Y"
-	if [ "$port" == 445 ]; then
-		service="smb"
-	elif [ "$port" == 161 ]; then
-		service="snmp"			
-	elif [ "$port" == 25 ]; then
-		service="smtp"	
-	elif [ "$port" == 21 ]; then
-		service="ftp"	
-	elif [ "$port" == 2049 ]; then
-		service="nfs"
-	elif [ "$port" == 22 ]; then
-		service="ssh"
-	elif [ "$port" == 23 ]; then
-		service="telnet"
-	elif [ "$port" == 111 ]; then
-		service="rpc"
-	elif [ "$port" == 137 ]; then
-		service="netbios"
-	elif [ "$port" == 139 ]; then
-		service="netbios"
-	elif [ "$port" == 3389 ]; then
-		service="rdp"
-	elif [ "$port" == 53 ]; then
-		service="dns"			
-	elif [ "$port" == 113 ]; then
-		service="ident"
-	elif [ "$port" == 79 ]; then
-		service="finger"
-	elif [ "$port" == 5432 ]; then
-		service="postgres"	
-	elif [ "$port" == 3306 ]; then
-		service="mysql"
-	elif [ "$port" == 1433 ]; then
-		service="mssql"			
-	elif [ "$port" == 443 ]; then
-		service="https"
-	elif [ "$port" == 80 ]; then
-		service="http"
-	elif [ "$port" == 636 ]; then
-		service="ldap"	
-	elif [ "$proto" == "udp" ] && [ "$port" == 161 ]; then
-		service="snmp"	
-	elif [ "$proto" == "udp" ] && [ "$port" == 177 ]; then
-		service="xdmcp"	
-	elif [ "$service" == "msrpc" ]; then
-		# dont print out msrpc ..pointless - stop the spam
-		printout="N"	
-	elif [ "$proto" == "udp" ] && [ "$service" == "unknown" ]; then
-		# dont udp + unknown ... cant really do much with this - stop spam
-		printout="N"		
-	elif [ -z "$service" ]; then
-		# dont udp + unknown ... cant really do much with this - stop spam
-		printout="N"	
-	fi
-	
-	
-	# print out the IP in port files
-	if [ "$printout" == "Y" ]; then
-		echo $host >> "$hostportspath"/"$proto"_"$port-$service.txt"		
-	fi	
+# single-pass awk replaces per-line shell loop for speed
+awk -F',' '{
+	host=$1; port=$2; proto=$4; service=$5
+	# clean service name
+	gsub(/[-?|]/, "", service)
+	# normalize known port names
+	if(port==445) service="smb"
+	else if(port==161) service="snmp"
+	else if(port==25) service="smtp"
+	else if(port==21) service="ftp"
+	else if(port==2049) service="nfs"
+	else if(port==22) service="ssh"
+	else if(port==23) service="telnet"
+	else if(port==111) service="rpc"
+	else if(port==137 || port==139) service="netbios"
+	else if(port==3389) service="rdp"
+	else if(port==53) service="dns"
+	else if(port==113) service="ident"
+	else if(port==79) service="finger"
+	else if(port==5432) service="postgres"
+	else if(port==3306) service="mysql"
+	else if(port==1433) service="mssql"
+	else if(port==443) service="https"
+	else if(port==80) service="http"
+	else if(port==636) service="ldap"
+	else if(proto=="udp" && port==161) service="snmp"
+	else if(proto=="udp" && port==177) service="xdmcp"
+	else if(service=="msrpc") next
+	else if(proto=="udp" && service=="unknown") next
+	else if(service=="") next
+	print host "\t" proto "_" port "-" service
+}' "$tempfile" | while IFS='	' read -r host fname; do
+	echo "$host" >> "$hostportspath/$fname.txt"
 done
 
 #function cleanup
@@ -914,16 +757,24 @@ fi
 function summay-log {
 echo -e "\e[1m\e[93m[>]\e[0m Summary log"
 
-cat *.log | grep Discover | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u > $ >  "${outpath}/hostslog.txt"
+if ! ls *.log 1>/dev/null 2>&1; then
+	echo -e "$RED	- no .log files found $RESETCOL"
+	echo ""
+	return
+fi
+
+# fix: removed leading / from paths - $outpath already ends with /
+# e.g. ${outpath}/hostslog.txt was producing parse//hostslog.txt
+cat *.log | grep Discover | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u > "${outpath}hostslog.txt"
 
 while read -r ip; do
-    grep "$ip" *.log | grep "Disco" | awk -v ip="$ip" '{print ip ":" $4}' >> "${outpath}/summarytemp.txt"
-done < "${outpath}/hostslog.txt"
-cat "${outpath}/summarytemp.txt" | sort -u > "${outpath}/summary.log"
+    grep "$ip" *.log | grep "Disco" | awk -v ip="$ip" '{print ip ":" $4}' >> "${outpath}summarytemp.txt"
+done < "${outpath}hostslog.txt"
+cat "${outpath}summarytemp.txt" | sort -u > "${outpath}summary.log"
  echo "	- summary.log"
 echo ""
-#cat "${outpath}/summary.log"
-rm -rf "${outpath}/hostslog.txt" "${outpath}/summarytemp.txt" 2>/dev/null >/dev/null
+#cat "${outpath}summary.log"
+rm -rf "${outpath}hostslog.txt" "${outpath}summarytemp.txt" 2>/dev/null >/dev/null
 }
 
 
@@ -942,6 +793,28 @@ for word in $(echo $*); do
 		#file+="$word "
 		cat "$(realpath $word)" | sort -V >> $inputtemp
 	fi
+	# accept single-dash versions of switches
+	case "$word" in
+		-help) word="--help" ;;
+		-all) word="--all" ;;
+		-csv) word="--csv" ;;
+		-summary) word="--summary" ;;
+		-summarylog) word="--summarylog" ;;
+		-unique) word="--unique" ;;
+		-up) word="--up" ;;
+		-down) word="--down" ;;
+		-ipport) word="--ipport" ;;
+		-smb) word="--smb" ;;
+		-web) word="--web" ;;
+		-ssl) word="--ssl" ;;
+		-tcp) word="--tcp" ;;
+		-udp) word="--udp" ;;
+		-hostports) word="--hostports" ;;
+		-closed) word="--closed" ;;
+		-report1) word="--report1" ;;
+		-html) word="--html" ;;
+		-recursive|-r) word="--recursive" ;;
+	esac
 	if [ $word == "--help" ]; then
 		helpmenu
 		switch+="$word"
@@ -1011,6 +884,11 @@ for word in $(echo $*); do
 		men_htmlreport="Y"
 		switch+="$word"
 	fi	
+	if [ $word == "--recursive" ] || [ $word == "--r" ]; then
+		# enable recursive .gnmap file discovery
+		men_recursive="Y"
+		switch+="$word"
+	fi
 	if [ $word == "--all" ]; then
 		#include 
 		men_all="Y"
@@ -1039,6 +917,21 @@ for word in $(echo $*); do
 	fi	
 done
 
+# recursive discovery of .gnmap files
+if [ "$men_recursive" == "Y" ]; then
+	echo -e "\e[1m\e[93m[>]\e[0m Recursively searching for .gnmap files..."
+	# exclude temp.gnmap from find - it lives in cwd and would cat into itself
+	gnmap_count=$(find . -name "*.gnmap" -type f ! -name "$inputtemp" | wc -l | tr -d ' ')
+	if [ "$gnmap_count" -gt 0 ]; then
+		echo "[*] Found $gnmap_count .gnmap files"
+		echo -n "[*] Loading..."
+		find . -name "*.gnmap" -type f ! -name "$inputtemp" -print0 | xargs -0 cat >> "$inputtemp"
+		echo -e "\r[*] $gnmap_count .gnmap files loaded"
+	else
+		echo "[*] No .gnmap files found"
+	fi
+	echo
+fi
 
 # does some checks on the input file to make sure its .gnmap + inspects the file to see its finished and has the right output flags -oA or -oG	
 if [ -z "$(file "$(realpath $inputtemp)" | grep -o -e ASCII && head "$(realpath $inputtemp)" | grep -o -e "\-oA" -e "\-oG" && cat "$(realpath $inputtemp)")" ]; then
@@ -1066,8 +959,9 @@ header
 # if all is selected make the outdir folder - stop the spam
 if [ "$createoutdir" == "Y" ]
 then 
-	export outpath="$(realpath $outdir)/"
+	# fix: mkdir before realpath - macOS BSD realpath fails on non-existent paths
 	mkdir $outdir > /dev/null 2>&1
+	export outpath="$(realpath $outdir)/"
 	#mv inputfile $outdir
 	mv temp.gnmap $outdir
 	export inputfilepath="$(realpath "$outdir/$inputtemp")"
@@ -1100,6 +994,12 @@ if [ "$men_summarylog" == "Y" ]; then summay-log; fi
 
 
 
+
+# print output directory location so user knows where files landed
+if [ "$createoutdir" == "Y" ]; then
+	echo -e "\e[1m\e[93m[>]\e[0m Output directory: ${outpath}"
+	echo
+fi
 
 # print footer once completed 
 footer
